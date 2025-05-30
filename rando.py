@@ -649,3 +649,122 @@ if prompt := st.chat_input("Ask me about any HR policy…"):
             col.markdown(f"**{src}** (pg {pg})")
             col.write(snippet)
 
+
+
+
+appppppppsidebarrrrrrrrrrrrrrr
+import streamlit as st
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.llms import Ollama
+
+# ─── NEW IMPORTS ───────────────────────────────────────────────────────────────
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import ConversationalRetrievalChain
+# ────────────────────────────────────────────────────────────────────────────────
+
+# ---- CONFIG ----
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+FAISS_PATH            = "vectorstore"  
+MODEL_NAME            = "gemma3:1b"
+
+# ---- PAGE SETUP & LOGO ----
+st.set_page_config(
+    page_title="HR Policy Chatbot",
+    page_icon="🤖",
+    layout="wide",
+)
+
+# Display company logo (place logo.png in the same directory)
+logo_path = "logo.png"
+if st.sidebar:  # show logo in sidebar
+    try:
+        st.sidebar.image(logo_path, width=120)
+    except Exception:
+        pass
+
+# ─── INIT COMPONENTS ----
+@st.cache_resource
+def load_chain():
+    # 1️⃣ Load embeddings + FAISS
+    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
+    db = FAISS.load_local(
+        FAISS_PATH,
+        embeddings,
+        allow_dangerous_deserialization=True
+    )
+
+    # 2️⃣ Create a retriever with MMR enabled
+    retriever = db.as_retriever(
+        search_type="mmr",      # ← Maximum Marginal Relevance
+        search_kwargs={
+            "k": 3,              # top 3 final docs
+            "fetch_k": 10        # fetch 10 then re-rank
+        }
+    )
+
+    # 3️⃣ Setup conversation memory
+    memory = ConversationBufferMemory(
+        memory_key="chat_history",
+        input_key="question",     # matches the chain’s input dict key
+        output_key="answer",      # matches the chain’s output dict key
+        return_messages=True
+    )
+
+    # 4️⃣ Build a conversational RAG chain
+    chain = ConversationalRetrievalChain.from_llm(
+        llm=Ollama(model=MODEL_NAME),
+        retriever=retriever,
+        memory=memory,
+        return_source_documents=True,
+        output_key="answer"
+    )
+    return chain
+
+# Instantiate the chain once
+qa_chain = load_chain()
+
+# ---- UI ----
+st.title("🤖 HR Policy Chatbot")
+st.markdown("Ask me anything about HR policies! (Try mentioning a specific policy name for filtering)")
+
+# Hold chat history in session
+if "history" not in st.session_state:
+    st.session_state.history = []
+
+query = st.text_input("Your question:")
+
+if query:
+    # ─── OPTIONAL: metadata filter based on policy mentions ────────────────────
+    policy_filter = {}
+    lowered = query.lower()
+    if "leave policy"   in lowered: policy_filter["source"] = "leave_policy.pdf"
+    elif "referral policy" in lowered: policy_filter["source"] = "employee_referral_policy.pdf"
+    # ────────────────────────────────────────────────────────────────────────────
+
+    with st.spinner("Thinking..."):
+        result = qa_chain(
+            {"question": query, 
+             **({"metadata_filter": policy_filter} if policy_filter else {})}
+        )
+
+    # Save history
+    st.session_state.history.append((query, result["answer"]))
+
+    # Display answer
+    st.subheader("📌 Answer:")
+    st.write(result["answer"])
+
+    # Display sources
+    with st.expander("📄 Sources"):
+        for doc in result["source_documents"]:
+            st.markdown(f"- **Source**: {doc.metadata.get('source', 'unknown')} | **Page**: {doc.metadata.get('page', 'n/a')}")
+            st.markdown(doc.page_content[:200] + "…")
+
+# ---- SIDEBAR HISTORY ----
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 🕑 Conversation History")
+for user_q, bot_a in st.session_state.history:
+    st.sidebar.markdown(f"**You:** {user_q}")  
+    st.sidebar.markdown(f"**Bot:** {bot_a}")
+
