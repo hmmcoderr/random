@@ -514,3 +514,138 @@ if prompt := st.chat_input("Ask me about any HR policy…"):
 st.markdown("---")
 st.caption("© 2025 PwC • For internal use only • hr_chatbot@pwc.com")
 
+
+
+
+
+
+
+apppppppppppppppppppppppppppppppppppppppp
+
+
+
+
+
+
+
+
+import streamlit as st
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.llms import Ollama
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import ConversationalRetrievalChain
+from langchain.callbacks.streamlit import StreamlitCallbackHandler
+
+# ─── CONFIG ────────────────────────────────────────────────────────────────────
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+FAISS_PATH           = "vectorstore"
+MODEL_NAME           = "gemma3:1b"
+
+# ─── PAGE & THEME SETUP ────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="PwC HR Chatbot",
+    page_icon="🤖",
+    layout="wide",
+)
+
+# Inline CSS for PwC theme & chat bubbles
+st.markdown("""
+<style>
+  .appview-container { background-color: #FFFFFF; color: #333333; font-family: "Helvetica Neue", Helvetica, Arial, sans-serif; }
+  .stButton>button { background-color: #FF8000; border-radius: 6px; color: white; }
+  .stSidebar .sidebar-content { background-color: #F7F7F7; }
+  .stChatMessage.user { background-color: #FFEFE0 !important; border-radius:12px; padding:8px; margin:4px 0; }
+  .stChatMessage.assistant { background-color: #F0F0F0 !important; border-radius:12px; padding:8px; margin:4px 0; }
+</style>
+""", unsafe_allow_html=True)
+# ─── HEADER ───────────────────────────────────────────────────────────────────
+logo_path = "images.png"
+col1, col2 = st.columns([1, 8], gap="small")
+with col1:
+    st.image(logo_path, width=88)
+with col2:
+    st.markdown(
+        "<h1 style='margin:0; color:#333;'>HR Assistant</h1>",
+        unsafe_allow_html=True
+    )
+
+# ─── LOAD & CACHE RAG RESOURCES ────────────────────────────────────────────────
+@st.cache_resource
+def load_resources():
+    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
+    db = FAISS.load_local(FAISS_PATH, embeddings, allow_dangerous_deserialization=True)
+    retriever = db.as_retriever(
+        search_type="mmr", search_kwargs={"k": 3, "fetch_k": 10}
+    )
+    memory = ConversationBufferMemory(
+        memory_key="chat_history", input_key="question", output_key="answer", return_messages=True
+    )
+    return retriever, memory
+
+retriever, memory = load_resources()
+
+# ─── SESSION STATE ─────────────────────────────────────────────────────────────
+if "history" not in st.session_state:
+    st.session_state.history = []
+if "topic_filter" not in st.session_state:
+    st.session_state.topic_filter = {}
+
+# ─── SIDEBAR: Conversation History ────────────────────────────────────────────
+st.sidebar.markdown("### 🕑 Conversation History")
+for entry in st.session_state.history:
+    role = "You" if entry["role"] == "user" else "Bot"
+    st.sidebar.markdown(f"**{role}:** {entry['text']}")
+
+# ─── CHAT INTERFACE ────────────────────────────────────────────────────────────
+# Display past chat messages
+for msg in st.session_state.history:
+    st.chat_message(msg["role"], avatar="🧑‍💼" if msg["role"]=="user" else "🤖").write(msg["text"])
+
+# Capture user input
+if prompt := st.chat_input("Ask me about any HR policy…"):
+    st.session_state.history.append({"role": "user", "text": prompt})
+
+    # Prepare metadata filter if needed
+    meta = {}
+    if "leave policy" in prompt.lower():
+        meta["source"] = "leave_policy.pdf"
+    if "referral policy" in prompt.lower():
+        meta["source"] = "employee_referral_policy.pdf"
+
+    # Set up streaming response area
+    response_container = st.empty()
+    stream_handler = StreamlitCallbackHandler(parent_container=response_container)
+
+    # Build streaming LLM & chain
+    llm = Ollama(model=MODEL_NAME, streaming=True, callbacks=[stream_handler])
+    chain = ConversationalRetrievalChain.from_llm(
+        llm=llm,
+        retriever=retriever,
+        memory=memory,
+        return_source_documents=True,
+        output_key="answer"
+    )
+
+    # Generate and display answer
+    with st.spinner("Thinking…"):
+        result = chain({
+            "question": prompt,
+            **({"metadata_filter": meta} if meta else {})
+        })
+    answer = result["answer"]
+
+    st.session_state.history.append({"role": "assistant", "text": answer})
+    st.chat_message("assistant", avatar="🤖").write(answer)
+
+    # Show source snippets
+    with st.expander("📄 Source Snippets"):
+        cols = st.columns(2)
+        for i, doc in enumerate(result["source_documents"]):
+            col = cols[i % 2]
+            src = doc.metadata.get("source", "unknown")
+            pg  = doc.metadata.get("page", "n/a")
+            snippet = doc.page_content[:150].replace("\n", " ") + "…"
+            col.markdown(f"**{src}** (pg {pg})")
+            col.write(snippet)
+
