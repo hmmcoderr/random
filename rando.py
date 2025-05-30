@@ -768,3 +768,23 @@ for user_q, bot_a in st.session_state.history:
     st.sidebar.markdown(f"**You:** {user_q}")  
     st.sidebar.markdown(f"**Bot:** {bot_a}")
 
+uyjfyujfvyhvjhgj
+
+
+
+
+policy_keywords = {
+    "leave policy":                "leave_policy.pdf",
+    "employee referral policy":    "employee_referral_policy.pdf",
+    "total rewards policy":        "total_rewards_policy.pdf",
+    "policy manual":               "policy_manual.pdf",
+}
+
+policy_filter = {}
+lowered = query.lower()
+
+for keyword, filename in policy_keywords.items():
+    if keyword in lowered:
+        policy_filter["source"] = filename
+        break
+
