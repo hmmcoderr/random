@@ -206,3 +206,160 @@ if st.session_state.history:
     for user_q, bot_a in st.session_state.history:
         st.markdown(f"**You:** {user_q}")  
         st.markdown(f"**Bot:** {bot_a}")
+
+
+
+
+
+appp
+
+
+
+import os
+import streamlit as st
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.llms import Ollama
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import ConversationalRetrievalChain
+from langchain.callbacks.streamlit import StreamlitCallbackHandler
+
+# ─── CONFIG ────────────────────────────────────────────────────────────────────
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+FAISS_PATH           = "vectorstore"
+MODEL_NAME           = "gemma3:1b"
+
+# ─── PAGE SETUP ────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="ACME HR Chatbot",
+    page_icon="🤖",
+    layout="wide",
+)
+
+# ─── CUSTOM CSS ───────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+  .stChatMessage { border-radius:12px; padding:8px; margin-bottom:4px; }
+  .stChatMessage.user { background-color:#e6f7ff; }
+  .stChatMessage.assistant { background-color:#f0f0f0; }
+</style>
+""", unsafe_allow_html=True)
+
+# ─── HEADER ───────────────────────────────────────────────────────────────────
+st.markdown(
+    """
+    <div style='display:flex; align-items:center;'>
+      <img src="https://path.to/your/logo.png" width="50" style='margin-right:12px'/>
+      <h1 style='margin:0; font-family:sans-serif;'>ACME Corp HR Assistant</h1>
+    </div>
+    <hr>
+    """,
+    unsafe_allow_html=True
+)
+
+# ─── LOAD & CACHE RAG CHAIN ───────────────────────────────────────────────────
+@st.cache_resource
+def load_chain():
+    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
+    db = FAISS.load_local(
+        FAISS_PATH,
+        embeddings,
+        allow_dangerous_deserialization=True
+    )
+    retriever = db.as_retriever(
+        search_type="mmr",
+        search_kwargs={"k": 3, "fetch_k": 10}
+    )
+    memory = ConversationBufferMemory(
+        memory_key="chat_history",
+        input_key="question",
+        output_key="answer",
+        return_messages=True
+    )
+    llm = Ollama(
+        model=MODEL_NAME,
+        streaming=True,
+        callbacks=[StreamlitCallbackHandler()]
+    )
+    return ConversationalRetrievalChain.from_llm(
+        llm=llm,
+        retriever=retriever,
+        memory=memory,
+        return_source_documents=True,
+        output_key="answer"
+    )
+
+qa_chain = load_chain()
+
+# ─── SESSION STATE FOR CHAT & TOPICS ───────────────────────────────────────────
+if "history" not in st.session_state:
+    st.session_state.history = []
+if "topic_filter" not in st.session_state:
+    st.session_state.topic_filter = {}
+
+# ─── SIDEBAR ───────────────────────────────────────────────────────────────────
+with st.sidebar.expander("📂 Manage Policies"):
+    uploaded = st.file_uploader("Upload new policy PDFs", type=["pdf"], accept_multiple_files=True)
+    if st.button("Rebuild Index"):
+        # TODO: save uploads to disk, re-run your ingestion + indexing pipeline,
+        # then clear cache so load_chain() reloads new vectorstore.
+        st.cache_resource.clear()
+        st.success("Vectorstore rebuilt!")
+
+st.sidebar.markdown("### 🔍 Quick Topics")
+for topic, src in [("Leave Policy", "leave_policy.pdf"),
+                   ("Referral Policy", "employee_referral_policy.pdf"),
+                   ("Benefits", None),
+                   ("Payroll", None)]:
+    if st.sidebar.button(topic):
+        st.session_state.history = []
+        if src:
+            st.session_state.topic_filter = {"source": src}
+        else:
+            st.session_state.topic_filter = {}
+        st.experimental_rerun()
+
+# ─── CHAT INTERFACE ────────────────────────────────────────────────────────────
+# 1️⃣ Display existing messages
+for msg in st.session_state.history:
+    st.chat_message(msg["role"], avatar="🧑‍💼" if msg["role"]=="user" else "🤖").write(msg["text"])
+
+# 2️⃣ Get user input
+if prompt := st.chat_input("Ask me about any HR policy…"):
+    # Save & show user
+    st.session_state.history.append({"role": "user", "text": prompt})
+
+    # Build metadata filter from sidebar or detect from text
+    meta = st.session_state.topic_filter.copy()
+    if "leave policy" in prompt.lower():
+        meta["source"] = "leave_policy.pdf"
+    elif "referral policy" in prompt.lower():
+        meta["source"] = "employee_referral_policy.pdf"
+
+    # 3️⃣ Generate answer with spinner + streaming
+    with st.spinner("Thinking…"):
+        result = qa_chain({
+            "question": prompt,
+            **({"metadata_filter": meta} if meta else {})
+        })
+    answer = result["answer"]
+
+    # 4️⃣ Save & show assistant
+    st.session_state.history.append({"role": "assistant", "text": answer})
+    st.chat_message("assistant", avatar="🤖").write(answer)
+
+    # 5️⃣ Show sources in two columns
+    with st.expander("📄 Source Snippets"):
+        cols = st.columns(2)
+        docs = result["source_documents"]
+        for i, doc in enumerate(docs):
+            col = cols[i % 2]
+            src = doc.metadata.get("source", "unknown")
+            pg  = doc.metadata.get("page", "n/a")
+            snippet = doc.page_content[:150].replace("\n", " ") + "…"
+            col.markdown(f"**{src} (pg {pg})**")
+            col.write(snippet)
+
+# ─── FOOTER ────────────────────────────────────────────────────────────────────
+st.markdown("---")
+st.caption("© 2025 ACME Corp • For internal use only • hr@acme.com")
