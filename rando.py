@@ -363,3 +363,154 @@ if prompt := st.chat_input("Ask me about any HR policy…"):
 # ─── FOOTER ────────────────────────────────────────────────────────────────────
 st.markdown("---")
 st.caption("© 2025 ACME Corp • For internal use only • hr@acme.com")
+
+
+
+
+
+
+appppppppp
+
+
+
+import os
+import streamlit as st
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.llms import Ollama
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import ConversationalRetrievalChain
+from langchain.callbacks.streamlit import StreamlitCallbackHandler
+
+# ─── CONFIG ────────────────────────────────────────────────────────────────────
+EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+FAISS_PATH           = "vectorstore"
+MODEL_NAME           = "gemma3:1b"
+
+# ─── PAGE & THEME SETUP ────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="PwC HR Chatbot",
+    page_icon="🤖",
+    layout="wide",
+)
+
+# Inline CSS for PwC theme & chat bubbles
+st.markdown("""
+<style>
+  /* Backgrounds and fonts */
+  .appview-container { background-color: #FFFFFF; color: #333333; font-family: "Helvetica Neue", Helvetica, Arial, sans-serif; }
+  .stButton>button { background-color: #FF8000; border-radius: 6px; color: white; }
+  .stSidebar .sidebar-content { background-color: #F7F7F7; }
+  /* Chat bubbles */
+  .stChatMessage.user { background-color: #FFEFE0 !important; border-radius:12px; padding:8px; margin:4px 0; }
+  .stChatMessage.assistant { background-color: #F0F0F0 !important; border-radius:12px; padding:8px; margin:4px 0; }
+</style>
+""", unsafe_allow_html=True)
+
+# ─── HEADER ───────────────────────────────────────────────────────────────────
+st.markdown("""
+<div style='display:flex; align-items:center; padding-bottom:8px;'>
+  <img src="https://your.pwc.logo/url.png" width="48" style='margin-right:12px;'/>
+  <h1 style='margin:0; color:#333;'>PwC HR Assistant</h1>
+</div>
+<hr>
+""", unsafe_allow_html=True)
+
+# ─── CACHED RESOURCE LOADER ────────────────────────────────────────────────────
+@st.cache_resource
+def load_resources():
+    # Embeddings + Vectorstore
+    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
+    db = FAISS.load_local(FAISS_PATH, embeddings, allow_dangerous_deserialization=True)
+    retriever = db.as_retriever(
+        search_type="mmr", search_kwargs={"k": 3, "fetch_k": 10}
+    )
+    # Conversation memory
+    memory = ConversationBufferMemory(
+        memory_key="chat_history", input_key="question", output_key="answer", return_messages=True
+    )
+    return retriever, memory
+
+retriever, memory = load_resources()
+
+# ─── SESSION STATE ─────────────────────────────────────────────────────────────
+if "history" not in st.session_state:
+    st.session_state.history = []
+if "topic_filter" not in st.session_state:
+    st.session_state.topic_filter = {}
+
+# ─── SIDEBAR ───────────────────────────────────────────────────────────────────
+with st.sidebar.expander("📂 Manage Policies"):
+    uploads = st.file_uploader("Upload policy PDFs", type="pdf", accept_multiple_files=True)
+    if st.button("Rebuild Index"):
+        # TODO: handle saving uploads & re-indexing
+        st.cache_resource.clear()
+        st.success("✅ Vectorstore rebuilt with new docs!")
+
+st.sidebar.markdown("### 🔍 Quick Topics")
+for label, src in [
+    ("Leave Policy", "leave_policy.pdf"),
+    ("Referral Policy", "employee_referral_policy.pdf"),
+    ("Benefits", None),
+    ("Payroll", None),
+]:
+    if st.sidebar.button(label):
+        st.session_state.history = []
+        st.session_state.topic_filter = {"source": src} if src else {}
+        st.experimental_rerun()
+
+# ─── CHAT UI ───────────────────────────────────────────────────────────────────
+# 1️⃣ Render existing chat
+for msg in st.session_state.history:
+    st.chat_message(msg["role"], avatar="🧑‍💼" if msg["role"]=="user" else "🤖").write(msg["text"])
+
+# 2️⃣ Capture user input
+if prompt := st.chat_input("Ask me about any HR policy…"):
+    st.session_state.history.append({"role": "user", "text": prompt})
+
+    # build metadata filter
+    meta = st.session_state.topic_filter.copy()
+    if "leave policy" in prompt.lower():      meta["source"] = "leave_policy.pdf"
+    if "referral policy" in prompt.lower():  meta["source"] = "employee_referral_policy.pdf"
+
+    # placeholder for streaming output
+    response_container = st.empty()
+    stream_handler = StreamlitCallbackHandler(parent_container=response_container)
+
+    # streaming LLM + chain
+    llm = Ollama(model=MODEL_NAME, streaming=True, callbacks=[stream_handler])
+    chain = ConversationalRetrievalChain.from_llm(
+        llm=llm,
+        retriever=retriever,
+        memory=memory,
+        return_source_documents=True,
+        output_key="answer"
+    )
+
+    # 3️⃣ Run the chain
+    with st.spinner("Thinking…"):
+        result = chain({
+            "question": prompt,
+            **({"metadata_filter": meta} if meta else {})
+        })
+
+    # 4️⃣ Show & store assistant reply
+    answer = result["answer"]
+    st.session_state.history.append({"role": "assistant", "text": answer})
+    st.chat_message("assistant", avatar="🤖").write(answer)
+
+    # 5️⃣ Two-column sources
+    with st.expander("📄 Source Snippets"):
+        cols = st.columns(2)
+        for i, doc in enumerate(result["source_documents"]):
+            col = cols[i % 2]
+            src = doc.metadata.get("source", "unknown")
+            pg  = doc.metadata.get("page", "n/a")
+            snippet = doc.page_content[:150].replace("\n", " ") + "…"
+            col.markdown(f"**{src}** (pg {pg})")
+            col.write(snippet)
+
+# ─── FOOTER ───────────────────────────────────────────────────────────────────
+st.markdown("---")
+st.caption("© 2025 PwC • For internal use only • hr_chatbot@pwc.com")
+
