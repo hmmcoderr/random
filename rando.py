@@ -788,3 +788,364 @@ for keyword, filename in policy_keywords.items():
         policy_filter["source"] = filename
         break
 
+
+ingest.py#2
+# ingest.py
+
+import os
+import re
+import pickle
+from pathlib import Path
+
+import pdfplumber
+from langchain.schema import Document
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+OUTPUT_PICKLE = DATA_DIR / "chunked_docs.pkl"
+
+# ─── HELPERS ──────────────────────────────────────────────────────────────────
+def extract_page_tables(pdf_path: str, page_number: int) -> str:
+    """
+    If the given page contains a table, convert it to Markdown and return as a string.
+    Otherwise, return an empty string.
+    """
+    with pdfplumber.open(pdf_path) as pdf:
+        page = pdf.pages[page_number]
+        table = page.extract_table()
+        if not table:
+            return ""
+        # Build a Markdown table
+        header = table[0]
+        separators = ["---"] * len(header)
+        rows = table[1:]
+        md_lines = []
+        # Header row
+        md_lines.append("| " + " | ".join(str(cell) for cell in header) + " |")
+        # Separator row
+        md_lines.append("| " + " | ".join(separators) + " |")
+        # Data rows
+        for row in rows:
+            # Replace None with empty string
+            row_cells = [str(cell) if cell is not None else "" for cell in row]
+            md_lines.append("| " + " | ".join(row_cells) + " |")
+        return "\n".join(md_lines)
+
+
+def load_and_process_all_pdfs(data_dir: Path) -> list[Document]:
+    """
+    Iterate through every PDF in `data_dir`, extract text + tables from each page,
+    and return a list of Documents (one per page) with metadata {"source", "page"}.
+    """
+    docs = []
+    for filepath in sorted(data_dir.iterdir()):
+        if filepath.suffix.lower() != ".pdf":
+            continue
+
+        filename = filepath.name
+        with pdfplumber.open(str(filepath)) as pdf:
+            num_pages = len(pdf.pages)
+            for page_idx in range(num_pages):
+                page = pdf.pages[page_idx]
+                text = page.extract_text() or ""
+                table_md = extract_page_tables(str(filepath), page_idx)
+
+                # Append table Markdown if present
+                combined = text
+                if table_md:
+                    combined = combined + "\n\n" + table_md
+
+                # Only create a Document if there's any content
+                if combined.strip():
+                    metadata = {
+                        "source": filename,
+                        "page": page_idx + 1,  # 1-based indexing
+                    }
+                    docs.append(Document(page_content=combined, metadata=metadata))
+    return docs
+
+
+def split_by_section_headers(pages: list[Document]) -> list[Document]:
+    """
+    Split each page’s content by numbered section headers (e.g., “1. ”, “2.1. ”).
+    Return a list of Documents, each corresponding to one section chunk.
+    """
+    section_pattern = r"(?m)(?=^\d+(\.\d+)*\.\s)"
+    section_chunks = []
+
+    for doc in pages:
+        text = doc.page_content
+        matches = list(re.finditer(section_pattern, text))
+        if not matches:
+            # No headers on this page; keep entire page as one chunk
+            section_chunks.append(Document(page_content=text, metadata=dict(doc.metadata)))
+            continue
+
+        starts = [m.start() for m in matches] + [len(text)]
+        for i in range(len(starts) - 1):
+            chunk_text = text[starts[i]:starts[i + 1]].strip()
+            if not chunk_text:
+                continue
+            new_meta = dict(doc.metadata)
+            new_meta["section_index"] = i + 1
+            section_chunks.append(Document(page_content=chunk_text, metadata=new_meta))
+
+    return section_chunks
+
+
+def recursive_chunking(section_chunks: list[Document]) -> list[Document]:
+    """
+    For any section chunk > 1200 characters, further split into ~1200-char chunks
+    with ~200-char overlap, respecting paragraph breaks where possible.
+    """
+    splitter = RecursiveCharacterTextSplitter(
+        separators=["\n\n", "\n", " ", ""],
+        chunk_size=1200,
+        chunk_overlap=200,
+        length_function=lambda x: len(x),
+    )
+
+    final_chunks = []
+    for sec in section_chunks:
+        content = sec.page_content
+        if len(content) <= 1200:
+            # No further splitting needed
+            final_chunks.append(sec)
+        else:
+            sub_texts = splitter.split_text(content)
+            for idx, txt in enumerate(sub_texts):
+                meta = dict(sec.metadata)
+                meta["subchunk_index"] = idx + 1
+                final_chunks.append(Document(page_content=txt, metadata=meta))
+    return final_chunks
+
+
+# ─── MAIN ORCHESTRATION ────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    print(f"📄 Loading and processing PDFs from {DATA_DIR}…")
+    raw_pages = load_and_process_all_pdfs(DATA_DIR)
+    print(f"   • Total pages processed: {len(raw_pages)}")
+
+    print("🔍 Splitting pages by numbered section headers…")
+    section_chunks = split_by_section_headers(raw_pages)
+    print(f"   • Total section-level chunks: {len(section_chunks)}")
+
+    print("✂️ Recursively chunking large sections (>1200 chars)…")
+    final_chunks = recursive_chunking(section_chunks)
+    print(f"   • Total final chunks: {len(final_chunks)}")
+
+    # Persist chunk list to disk for reuse during embedding
+    with open(OUTPUT_PICKLE, "wb") as f:
+        pickle.dump(final_chunks, f)
+    print(f"✅ All chunks saved to: {OUTPUT_PICKLE}")
+
+
+
+embed.py#2
+# embed.py
+
+import os
+import pickle
+from pathlib import Path
+
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
+# Assume this script lives in the same “src/” directory as ingest.py,
+# so BASE_DIR points to project root.
+BASE_DIR = Path(__file__).resolve().parent.parent
+CHUNK_PICKLE = BASE_DIR / "data" / "chunked_docs.pkl"
+FAISS_DIR = BASE_DIR / "vectorstore"
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+
+def main():
+    # 1️⃣ Load pre-chunked Documents from the pickle generated by ingest.py
+    if not CHUNK_PICKLE.exists():
+        raise FileNotFoundError(
+            f"❌ Chunk pickle not found at {CHUNK_PICKLE}. "
+            "Run ingest.py first to generate chunked_docs.pkl."
+        )
+
+    with open(CHUNK_PICKLE, "rb") as f:
+        all_chunks = pickle.load(f)
+
+    print(f"🔍 Loaded {len(all_chunks)} pre-chunked Document objects.")
+
+    # 2️⃣ Initialize the embedding model (must match retrieval side)
+    print(f"⚙️ Initializing embeddings with model: {EMBEDDING_MODEL}")
+    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+
+    # 3️⃣ Build a new FAISS index from documents
+    print("⏳ Creating FAISS vector store from chunks...")
+    vectorstore = FAISS.from_documents(all_chunks, embeddings)
+
+    # 4️⃣ Ensure the output directory exists
+    FAISS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 5️⃣ Save the FAISS index locally
+    vectorstore.save_local(str(FAISS_DIR))
+    print(f"✅ FAISS vector store saved to: {FAISS_DIR}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+chat.py#2
+# app.py
+
+import os
+import streamlit as st
+from pathlib import Path
+
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_community.llms import Ollama
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import ConversationalRetrievalChain
+from langchain.prompts import PromptTemplate
+
+st.set_page_config(page_title="HR Policy Chatbot", layout="wide")
+
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
+BASE_DIR = Path(__file__).resolve().parent.parent
+FAISS_DIR = BASE_DIR / "vectorstore"
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+LLM_MODEL = "gemma3:1b"
+
+# Keywords → PDF filename mapping for metadata filtering
+POLICY_KEYWORDS = {
+    "employee referral":    "employee_referral_policy.pdf",
+    "leave policy":         "leave_policy.pdf",
+    "total rewards":        "total_rewards_policy.pdf",
+    "policy manual":        "policy_manual.pdf",
+}
+
+
+# ─── LOAD & SET UP RAG CHAIN ─────────────────────────────────────────────────
+@st.cache_resource
+def load_chain():
+    # 1️⃣ Initialize embeddings (must match index)
+    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+
+    # 2️⃣ Load FAISS index
+    if not FAISS_DIR.exists():
+        raise FileNotFoundError(
+            f"FAISS index not found at {FAISS_DIR}. Run embed.py first."
+        )
+    db = FAISS.load_local(
+        str(FAISS_DIR),
+        embeddings,
+        allow_dangerous_deserialization=True
+    )
+
+    # 3️⃣ Create retriever (using simple similarity; adjust k/fetch_k as needed)
+    retriever = db.as_retriever(
+        search_type="similarity",
+        search_kwargs={
+            "k": 5,        # return top 5
+            "fetch_k": 10  # fetch 10, then pick 5
+        }
+    )
+
+    # 4️⃣ Conversation memory for back-and-forth
+    memory = ConversationBufferMemory(
+        memory_key="chat_history",
+        input_key="question",
+        output_key="answer",
+        return_messages=True
+    )
+
+    # 5️⃣ Custom system prompt to enforce grounding and table interpretation
+    system_prompt = """
+You are an HR‐policy assistant. Use ONLY the provided context to answer.
+- If the context contains a Markdown table, interpret “✓” as “Yes/Eligible” and “✗” as “No/Not Eligible.”
+- If the answer cannot be found in the context, respond: “I’m sorry, I don’t have that information.”
+"""
+
+    # 6️⃣ Combine prompt template placing context + question under system instructions
+    combine_prompt =  PromptTemplate(
+        input_variables=["context", "question"],
+        template=(
+            system_prompt
+            + "\n\nContext:\n{context}\n\nQuestion:\n{question}\n\nAnswer:"
+        ),
+    )
+
+    # 7️⃣ Build the ConversationalRetrievalChain
+    chain = ConversationalRetrievalChain.from_llm(
+        llm=Ollama(model=LLM_MODEL),
+        retriever=retriever,
+        memory=memory,                        # retains chat history for follow-ups
+        return_source_documents=True,
+        combine_docs_chain_kwargs={"prompt": combine_prompt},
+    )
+    return chain
+
+
+qa_chain = load_chain()
+
+
+# ─── STREAMLIT UI ────────────────────────────────────────────────────────────
+
+st.title("🤖 HR Policy Chatbot")
+st.markdown("Ask me anything about HR policies. You can also ask follow-up questions in context.")
+
+# Initialize session state for chat history
+if "history" not in st.session_state:
+    st.session_state.history = []
+
+# User input
+query = st.text_input("Your question:")
+
+if query:
+    # 1️⃣ Build metadata_filter if the query mentions a known policy keyword
+    policy_filter = {}
+    lowered = query.lower()
+    for kw, filename in POLICY_KEYWORDS.items():
+        if kw in lowered:
+            policy_filter["source"] = filename
+            break
+
+    # 2️⃣ Call the RAG chain
+    with st.spinner("Thinking..."):
+        if policy_filter:
+            result = qa_chain({"question": query, "metadata_filter": policy_filter})
+        else:
+            result = qa_chain({"question": query})
+
+    answer = result["answer"]
+    source_docs = result["source_documents"]
+
+    # 3️⃣ Append to conversation history
+    st.session_state.history.append((query, answer))
+
+    # 4️⃣ Display the answer
+    st.subheader("📌 Answer:")
+    st.write(answer)
+
+    # 5️⃣ Show retrieved source chunks
+    with st.expander("📄 Source Chunks"):
+        for doc in source_docs:
+            src = doc.metadata.get("source", "unknown")
+            page = doc.metadata.get("page", "n/a")
+            section_idx = doc.metadata.get("section_index", "")
+            subchunk_idx = doc.metadata.get("subchunk_index", "")
+            st.markdown(
+                f"- **File:** {src} | **Page:** {page} "
+                f"{f'| Section: {section_idx}' if section_idx else ''} "
+                f"{f'| Subchunk: {subchunk_idx}' if subchunk_idx else ''}"
+            )
+            snippet = doc.page_content.strip().replace("\n", " ")
+            st.markdown(f"    > {snippet[:200]}…")
+
+# Sidebar: conversation history
+st.sidebar.markdown("### 🕑 Conversation History")
+for user_q, bot_a in st.session_state.history:
+    st.sidebar.markdown(f"**You:** {user_q}")
+    st.sidebar.markdown(f"**Bot:** {bot_a}")
+
