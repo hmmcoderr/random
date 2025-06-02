@@ -1336,3 +1336,279 @@ for entry in reversed(st.session_state.history):
     with st.sidebar.expander(user_q):
         st.write(bot_a)
 
+
+
+
+
+
+
+history +2 step rag
+import os                                   # unchanged
+import json                                 # unchanged
+import streamlit as st                      # unchanged
+from pathlib import Path                    # unchanged
+
+# ─── NEW & CHANGED IMPORTS ───────────────────────────────────────────────────
+import numpy as np                          # new addition: for cosine similarity
+
+from langchain.schema import Document        # new addition: to build source_docs manually
+from langchain.text_splitter import RecursiveCharacterTextSplitter  # unchanged
+
+from langchain_community.embeddings import HuggingFaceEmbeddings  # unchanged
+from langchain_community.vectorstores import FAISS                 # unchanged
+from langchain_community.llms import Ollama                        # unchanged
+from langchain.memory import ConversationBufferMemory              # unchanged (optional)
+from langchain.chains import ConversationalRetrievalChain          # unchanged (we won’t use its retrieval in two-stage)
+from langchain.prompts import PromptTemplate                       # unchanged
+
+st.set_page_config(page_title="HR Policy Chatbot", layout="wide")  # unchanged
+
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
+BASE_DIR = Path(__file__).resolve().parent.parent                  # unchanged
+FAISS_DIR = BASE_DIR / "vectorstore"                                # unchanged
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"          # unchanged
+LLM_MODEL = "gemma3:4b"                                             # unchanged
+
+# Where to keep the chat history
+HISTORY_FILE = BASE_DIR / "data" / "chat_history.json"             # unchanged
+
+# Keywords → PDF filename mapping for metadata filtering
+POLICY_KEYWORDS = {                                                 # unchanged
+    "employee referral":    "employee_referral_policy.pdf",
+    "leave policy":         "leave_policy.pdf",
+    "total rewards":        "total_rewards_policy.pdf",
+    "policy manual":        "policy_manual.pdf",
+}
+
+
+# ─── LOAD PERSISTED HISTORY ──────────────────────────────────────────────────
+if "history" not in st.session_state:                               # unchanged
+    if HISTORY_FILE.exists():                                        # unchanged
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:         # unchanged
+            try:                                                     # unchanged
+                st.session_state.history = json.load(f)              # unchanged
+            except json.JSONDecodeError:                             # unchanged
+                st.session_state.history = []                        # unchanged
+    else:                                                            # unchanged
+        st.session_state.history = []                                 # unchanged
+
+
+# ─── ORIGINAL LOAD & SET UP RAG CHAIN (commented out; two-stage will replace retrieval) ────
+# @st.cache_resource
+# def load_chain():
+#     # 1️⃣ Initialize embeddings (must match index)
+#     embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+#
+#     # 2️⃣ Load FAISS index
+#     if not FAISS_DIR.exists():
+#         raise FileNotFoundError(
+#             f"FAISS index not found at {FAISS_DIR}. Run embed.py first."
+#         )
+#     db = FAISS.load_local(
+#         str(FAISS_DIR),
+#         embeddings,
+#         allow_dangerous_deserialization=True
+#     )
+#
+#     # 3️⃣ Create retriever
+#     retriever = db.as_retriever(
+#         search_type="similarity",
+#         search_kwargs={"k": 5, "fetch_k": 10}
+#     )
+#
+#     # 4️⃣ Conversation memory (only in-memory; chat_history persists separately)
+#     memory = ConversationBufferMemory(
+#         memory_key="chat_history",
+#         input_key="question",
+#         output_key="answer",
+#         return_messages=True
+#     )
+#
+#     # 5️⃣ Custom system prompt
+#     system_prompt = """
+# You are an HR‐policy assistant. Use ONLY the provided context to answer.
+# - If the context contains a Markdown table, interpret “✓” as “Yes/Eligible” and “✗” as “No/Not Eligible.”
+# - If the answer cannot be found in the context, respond: “I’m sorry, I don’t have that information.”
+# """
+#
+#     # 6️⃣ Combine prompt template
+#     combine_prompt = PromptTemplate(
+#         input_variables=["context", "question"],
+#         template=(
+#             system_prompt
+#             + "\n\nContext:\n{context}\n\nQuestion:\n{question}\n\nAnswer:"
+#         ),
+#     )
+#
+#     # 7️⃣ Build the ConversationalRetrievalChain
+#     chain = ConversationalRetrievalChain.from_llm(
+#         llm=Ollama(model=LLM_MODEL),
+#         retriever=retriever,
+#         memory=memory,
+#         return_source_documents=True,
+#         combine_docs_chain_kwargs={"prompt": combine_prompt},
+#     )
+#     return chain
+#
+# qa_chain = load_chain()
+
+
+# ─── NEW: LOAD FAISS + MINI‐LM EMBEDDINGS + RECONSTRUCT ALL VECTORS ─────────────
+@st.cache_resource
+def load_resources():
+    # 1️⃣ Initialize MiniLM embeddings (for stage 1 filtering)
+    miniLM = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+
+    # 2️⃣ Load FAISS index
+    if not FAISS_DIR.exists():
+        raise FileNotFoundError(
+            f"FAISS index not found at {FAISS_DIR}. Run embed.py first."
+        )
+    faiss_db = FAISS.load_local(
+        str(FAISS_DIR),
+        miniLM,  # use MiniLM for embedding interface
+        allow_dangerous_deserialization=True
+    )
+
+    # 3️⃣ Reconstruct all stored embeddings into a NumPy array
+    total_vectors = faiss_db._faiss_index.ntotal
+    all_emb_matrix = faiss_db._faiss_index.reconstruct_n(0, total_vectors)  # shape: (N, dim)
+
+    # 4️⃣ Extract parallel lists: chunk texts and metadata
+    all_chunks_texts = faiss_db._texts.copy()       # list of chunk strings
+    all_chunks_metas  = faiss_db._metadatas.copy()  # list of metadata dicts
+
+    return faiss_db, miniLM, all_chunks_texts, all_chunks_metas, all_emb_matrix
+
+# Invoke loader at top level
+faiss_db, miniLM, all_chunks_texts, all_chunks_metas, all_embeddings = load_resources()
+
+
+# ─── NEW: TWO‐STAGE RAG HELPER FUNCTION ───────────────────────────────────────
+def answer_query_two_stage(query: str, miniLM, texts, metas, embeddings):
+    # 1️⃣ Compute query embedding (MiniLM)
+    q_emb = miniLM.embed_query(query)            # returns list[float]
+    q_vec = np.array(q_emb, dtype="float32")      # shape: (dim,)
+
+    # 2️⃣ Cosine similarity vs. all stored embeddings
+    q_norm = q_vec / np.linalg.norm(q_vec)
+    emb_norms = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)  # (N, dim) normalized
+    sims = emb_norms @ q_norm                   # shape: (N,)
+
+    # 3️⃣ Select top_k indices
+    top_k = 2                                   # pick top 2 chunks
+    idx_sorted = np.argsort(sims)[-top_k:][::-1]  # descending order
+
+    # 4️⃣ Build condensed context string
+    selected_texts = [texts[i] for i in idx_sorted]
+    selected_metas  = [metas[i]  for i in idx_sorted]
+    condensed_context = "\n---\n".join(selected_texts)
+
+    # 5️⃣ Construct system prompt + context + question
+    system_prompt = """
+You are an HR‐policy assistant. Use ONLY the provided context to answer.
+- If the context contains a Markdown table, interpret “✓” as “Yes/Eligible” and “✗” as “No/Not Eligible.”
+- If the answer cannot be found in the context, respond: “I’m sorry, I don’t have that information.”
+"""
+    prompt = f"""{system_prompt}
+
+Context:
+{condensed_context}
+
+Question:
+{query}
+
+Answer:
+"""
+    # Call Gemma 4B once
+    llm = Ollama(model=LLM_MODEL)
+    answer = llm(prompt)
+
+    # 6️⃣ Prepare source_docs list in same structure
+    source_docs = []
+    for idx in idx_sorted:
+        doc = Document(page_content=texts[idx], metadata=metas[idx])
+        source_docs.append(doc)
+
+    return answer, source_docs
+
+
+# ─── STREAMLIT UI ────────────────────────────────────────────────────────────
+st.title("🤖 HR Policy Chatbot")                                           # unchanged
+st.markdown("Ask me anything about HR policies. You can also ask follow-up questions in context.")  # unchanged
+
+# User input
+query = st.text_input("Your question:")                                   # unchanged
+
+if query:
+    # 1️⃣ Build metadata_filter if the query mentions a known policy keyword
+    policy_filter = {}                                                    # unchanged
+    lowered = query.lower()                                               # unchanged
+    for kw, filename in POLICY_KEYWORDS.items():                          # unchanged
+        if kw in lowered:                                                 # unchanged
+            policy_filter["source"] = filename                            # unchanged
+            break                                                         # unchanged
+
+    # ─── TWO‐STAGE RAG INSTEAD OF qa_chain CALL ────────────────────────────
+    with st.spinner("Thinking (two‐stage RAG)…"):                          # changed
+        if policy_filter:
+            # 1.a) Apply metadata filter to FAISS (LangChain’s pseudo‐API)
+            # You may need to adapt to your installed LangChain version.
+            filtered_db = faiss_db.filter(lambda m: m.get("source") == filename)  # new addition
+
+            # Reconstruct filtered embeddings & texts & metas
+            filtered_total = filtered_db._faiss_index.ntotal                           # new addition
+            emb_matrix_filt = filtered_db._faiss_index.reconstruct_n(0, filtered_total)  # new addition
+            texts_filt = filtered_db._texts.copy()                                     # new addition
+            metas_filt = filtered_db._metadatas.copy()                                  # new addition
+
+            answer, source_docs = answer_query_two_stage(
+                query,
+                miniLM,
+                texts_filt,
+                metas_filt,
+                emb_matrix_filt
+            )                                                                         # new addition
+        else:
+            # No metadata filter → use full index
+            answer, source_docs = answer_query_two_stage(
+                query,
+                miniLM,
+                all_chunks_texts,
+                all_chunks_metas,
+                all_embeddings
+            )                                                                         # new addition
+
+    # 2️⃣ Persist the new Q/A pair to session state and to disk
+    entry = {"question": query, "answer": answer}                               # unchanged
+    st.session_state.history.append(entry)                                      # unchanged
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:                         # unchanged
+        json.dump(st.session_state.history, f, indent=2)                         # unchanged
+
+    # 3️⃣ Display the answer
+    st.subheader("📌 Answer:")                                                   # unchanged
+    st.write(answer)                                                            # unchanged
+
+    # 4️⃣ Show retrieved source chunks
+    with st.expander("📄 Source Chunks"):                                        # unchanged
+        for doc in source_docs:                                                 # changed: iterating source_docs from two-stage
+            src = doc.metadata.get("source", "unknown")                          # unchanged
+            page = doc.metadata.get("page", "n/a")                               # unchanged
+            section_idx = doc.metadata.get("section_index", "")                  # unchanged
+            subchunk_idx = doc.metadata.get("subchunk_index", "")                # unchanged
+            st.markdown(                                                         # unchanged
+                f"- **File:** {src} | **Page:** {page} "
+                f"{f'| Section: {section_idx}' if section_idx else ''} "
+                f"{f'| Subchunk: {subchunk_idx}' if subchunk_idx else ''}"
+            )
+            snippet = doc.page_content.strip().replace("\n", " ")                # unchanged
+            st.markdown(f"    > {snippet[:200]}…")                                 # unchanged
+
+
+# ─── SIDEBAR: Conversation History ───────────────────────────────────────────
+st.sidebar.markdown("### 🕑 Conversation History")                            # unchanged
+for entry in reversed(st.session_state.history):                               # unchanged
+    user_q = entry["question"]                                                # unchanged
+    bot_a   = entry["answer"]                                                  # unchanged
+    with st.sidebar.expander(user_q):                                          # unchanged
+        st.write(bot_a)                                                         # unchanged
