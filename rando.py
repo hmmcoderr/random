@@ -1149,3 +1149,190 @@ for user_q, bot_a in st.session_state.history:
     st.sidebar.markdown(f"**You:** {user_q}")
     st.sidebar.markdown(f"**Bot:** {bot_a}")
 
+
+
+
+import os
+import json
+import streamlit as st
+from pathlib import Path
+
+# ─── OCR LIBRARY: We now use EasyOCR instead of Tesseract ─────────────────────
+import easyocr
+from PIL import Image
+
+from langchain.schema import Document
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_community.llms import Ollama
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import ConversationalRetrievalChain
+from langchain.prompts import PromptTemplate
+
+st.set_page_config(page_title="HR Policy Chatbot", layout="wide")
+
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
+BASE_DIR = Path(__file__).resolve().parent.parent
+FAISS_DIR = BASE_DIR / "vectorstore"
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+LLM_MODEL = "gemma3:4b"
+HISTORY_FILE = BASE_DIR / "data" / "chat_history.json"
+
+POLICY_KEYWORDS = {
+    "employee referral":    "employee_referral_policy.pdf",
+    "leave policy":         "leave_policy.pdf",
+    "total rewards":        "total_rewards_policy.pdf",
+    "policy manual":        "policy_manual.pdf",
+}
+
+# ─── LOAD PERSISTED HISTORY ──────────────────────────────────────────────────
+if "history" not in st.session_state:
+    if HISTORY_FILE.exists():
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            try:
+                st.session_state.history = json.load(f)
+            except json.JSONDecodeError:
+                st.session_state.history = []
+    else:
+        st.session_state.history = []
+
+
+# ─── LOAD & SET UP RAG CHAIN ─────────────────────────────────────────────────
+@st.cache_resource
+def load_chain():
+    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+
+    if not FAISS_DIR.exists():
+        raise FileNotFoundError(
+            f"FAISS index not found at {FAISS_DIR}. Run embed.py first."
+        )
+    db = FAISS.load_local(str(FAISS_DIR), embeddings, allow_dangerous_deserialization=True)
+
+    retriever = db.as_retriever(search_type="similarity", search_kwargs={"k": 5, "fetch_k": 10})
+
+    memory = ConversationBufferMemory(
+        memory_key="chat_history",
+        input_key="question",
+        output_key="answer",
+        return_messages=True
+    )
+
+    system_prompt = """
+You are an HR‐policy assistant. Use ONLY the provided context to answer.
+- If the context contains a Markdown table, interpret “✓” as “Yes/Eligible” and “✗” as “No/Not Eligible.”
+- If the answer cannot be found in the context, respond: “I’m sorry, I don’t have that information.”
+"""
+
+    combine_prompt = PromptTemplate(
+        input_variables=["context", "question"],
+        template=(
+            system_prompt
+            + "\n\nContext:\n{context}\n\nQuestion:\n{question}\n\nAnswer:"
+        ),
+    )
+
+    chain = ConversationalRetrievalChain.from_llm(
+        llm=Ollama(model=LLM_MODEL),
+        retriever=retriever,
+        memory=memory,
+        return_source_documents=True,
+        combine_docs_chain_kwargs={"prompt": combine_prompt},
+    )
+    return chain
+
+qa_chain = load_chain()
+
+# ─── STREAMLIT UI ────────────────────────────────────────────────────────────
+st.title("🤖 HR Policy Chatbot")
+st.markdown("Ask me anything about HR policies. You can also ask follow-up questions in context.")
+
+# ─── NEW: Image uploader + EasyOCR ───────────────────────────────────────────
+uploaded_file = st.file_uploader("Upload an image (PNG/JPG):", type=["png", "jpg", "jpeg"])
+
+if uploaded_file is not None:
+    image = Image.open(uploaded_file)
+    st.image(image, caption="Uploaded image", use_column_width=True)
+
+    # Convert to RGB array
+    img_array = __import__('numpy').array(image.convert("RGB"))
+
+    # Create & cache the EasyOCR reader (only loads once per session)
+    @st.cache_resource(show_spinner=False)
+    def get_easyocr_reader():
+        return easyocr.Reader(['en'], gpu=False)
+
+    reader = get_easyocr_reader()
+    ocr_result = reader.readtext(img_array)
+
+    # Combine all detected text segments
+    ocr_text = " ".join([segment[1] for segment in ocr_result])
+    st.text_area("📝 Extracted text from image:", ocr_text, height=200)
+
+    if ocr_text.strip():
+        splitter = RecursiveCharacterTextSplitter(
+            separators=["\n\n", "\n", " ", ""],
+            chunk_size=1000,
+            chunk_overlap=200,
+            length_function=lambda x: len(x),
+        )
+        ocr_subtexts = splitter.split_text(ocr_text)
+
+        ocr_docs = []
+        for idx, chunk in enumerate(ocr_subtexts):
+            meta = {"source": uploaded_file.name, "ocr_chunk": idx + 1}
+            ocr_docs.append(Document(page_content=chunk, metadata=meta))
+
+        qa_chain.retriever.vectorstore.add_documents(ocr_docs)
+
+# ─── USER INPUT & QA LOGIC ───────────────────────────────────────────────────
+query = st.text_input("Your question:")
+
+if query:
+    policy_filter = {}
+    lowered = query.lower()
+    for kw, filename in POLICY_KEYWORDS.items():
+        if kw in lowered:
+            policy_filter["source"] = filename
+            break
+
+    with st.spinner("Thinking..."):
+        if policy_filter:
+            result = qa_chain({"question": query, "metadata_filter": policy_filter})
+        else:
+            result = qa_chain({"question": query})
+
+    answer = result["answer"]
+    source_docs = result["source_documents"]
+
+    entry = {"question": query, "answer": answer}
+    st.session_state.history.append(entry)
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(st.session_state.history, f, indent=2)
+
+    st.subheader("📌 Answer:")
+    st.write(answer)
+
+    with st.expander("📄 Source Chunks"):
+        for doc in source_docs:
+            src = doc.metadata.get("source", "unknown")
+            page = doc.metadata.get("page", "n/a")
+            section_idx = doc.metadata.get("section_index", "")
+            subchunk_idx = doc.metadata.get("subchunk_index", "")
+            st.markdown(
+                f"- **File:** {src} | **Page:** {page} "
+                f"{f'| Section: {section_idx}' if section_idx else ''} "
+                f"{f'| Subchunk: {subchunk_idx}' if subchunk_idx else ''}"
+            )
+            snippet = doc.page_content.strip().replace("\n", " ")
+            st.markdown(f"    > {snippet[:200]}…")
+
+# ─── SIDEBAR: Conversation History (latest on top, question as expander) ────
+st.sidebar.markdown("### 🕑 Conversation History")
+for entry in reversed(st.session_state.history):
+    user_q = entry["question"]
+    bot_a   = entry["answer"]
+    with st.sidebar.expander(user_q):
+        st.write(bot_a)
+
